@@ -1,31 +1,9 @@
-import asyncio
 import os
-import json
-from twikit import Client
+import asyncio
+import httpx
 
-TWITTER_USERNAME = os.environ.get("TWITTER_USERNAME")
-TWITTER_EMAIL = os.environ.get("TWITTER_EMAIL")
-TWITTER_PASSWORD = os.environ.get("TWITTER_PASSWORD")
-COOKIES_FILE = "cookies.json"
-
-async def get_client() -> Client:
-    client = Client(language="en-US")
-    if os.path.exists(COOKIES_FILE):
-        try:
-            client.load_cookies(COOKIES_FILE)
-            return client
-        except Exception:
-            # Cookies invalid, re-login
-            os.remove(COOKIES_FILE)
-
-    # Login with email as primary auth (more reliable than username)
-    await client.login(
-        auth_info_1=TWITTER_EMAIL,
-        auth_info_2=TWITTER_USERNAME,
-        password=TWITTER_PASSWORD,
-    )
-    client.save_cookies(COOKIES_FILE)
-    return client
+APIFY_TOKEN = os.environ.get("APIFY_TOKEN")
+ACTOR_ID = "61RPP7dywgiy0JPD0"  # Apify Twitter Scraper
 
 PREDICTION_KEYWORDS = [
     "will never", "will always", "i predict", "prediction:", "guaranteed",
@@ -41,34 +19,61 @@ def is_prediction(text: str) -> bool:
     return any(kw in text_lower for kw in PREDICTION_KEYWORDS)
 
 async def get_prediction_tweets(username: str, max_tweets: int = 200) -> list[dict]:
-    client = await get_client()
+    async with httpx.AsyncClient(timeout=120) as client:
 
-    # Get user
-    user = await client.get_user_by_screen_name(username)
-    if not user:
-        return []
+        # Start Apify actor run
+        run_response = await client.post(
+            f"https://api.apify.com/v2/acts/{ACTOR_ID}/runs?token={APIFY_TOKEN}",
+            json={
+                "startUrls": [{"url": f"https://twitter.com/{username}"}],
+                "maxItems": max_tweets,
+                "addUserInfo": False,
+                "scrapeTweetReplies": False,
+            }
+        )
+        run_data = run_response.json()
+        run_id = run_data.get("data", {}).get("id")
 
-    tweets = []
-    fetched = 0
-    results = await client.get_user_tweets(user.id, tweet_type="Tweets", count=40)
+        if not run_id:
+            raise Exception(f"Failed to start Apify run: {run_data}")
 
-    while results and fetched < max_tweets:
-        for tweet in results:
-            if is_prediction(tweet.text):
+        # Poll until finished (max ~2 minutes)
+        status = None
+        status_response = None
+        for _ in range(24):
+            await asyncio.sleep(5)
+            status_response = await client.get(
+                f"https://api.apify.com/v2/actor-runs/{run_id}?token={APIFY_TOKEN}"
+            )
+            status = status_response.json().get("data", {}).get("status")
+            if status == "SUCCEEDED":
+                break
+            elif status in ("FAILED", "ABORTED", "TIMED-OUT"):
+                raise Exception(f"Apify run failed with status: {status}")
+
+        if status != "SUCCEEDED":
+            raise Exception("Apify run timed out.")
+
+        # Fetch results
+        dataset_id = status_response.json().get("data", {}).get("defaultDatasetId")
+        items_response = await client.get(
+            f"https://api.apify.com/v2/datasets/{dataset_id}/items?token={APIFY_TOKEN}&limit={max_tweets}"
+        )
+        items = items_response.json()
+
+        # Filter for predictions only
+        tweets = []
+        for item in items:
+            text = item.get("full_text") or item.get("text") or ""
+            if not text or text.startswith("RT "):
+                continue
+            if is_prediction(text):
+                tweet_id = str(item.get("id_str") or item.get("id") or "")
                 tweets.append({
-                    "id": tweet.id,
-                    "text": tweet.text,
-                    "created_at": str(tweet.created_at),
-                    "url": f"https://x.com/{username}/status/{tweet.id}"
+                    "id": tweet_id,
+                    "text": text,
+                    "created_at": item.get("created_at", ""),
+                    "url": f"https://x.com/{username}/status/{tweet_id}"
                 })
-            fetched += 1
-            if fetched >= max_tweets:
-                break
 
-        if fetched < max_tweets:
-            try:
-                results = await results.next()
-            except Exception:
-                break
-
-    return tweets
+        return tweets
