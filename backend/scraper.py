@@ -11,14 +11,20 @@ COOKIES_FILE = "cookies.json"
 async def get_client() -> Client:
     client = Client(language="en-US")
     if os.path.exists(COOKIES_FILE):
-        client.load_cookies(COOKIES_FILE)
-    else:
-        await client.login(
-            auth_info_1=TWITTER_USERNAME,
-            auth_info_2=TWITTER_EMAIL,
-            password=TWITTER_PASSWORD,
-        )
-        client.save_cookies(COOKIES_FILE)
+        try:
+            client.load_cookies(COOKIES_FILE)
+            return client
+        except Exception:
+            # Cookies invalid, re-login
+            os.remove(COOKIES_FILE)
+
+    # Login with email as primary auth (more reliable than username)
+    await client.login(
+        auth_info_1=TWITTER_EMAIL,
+        auth_info_2=TWITTER_USERNAME,
+        password=TWITTER_PASSWORD,
+    )
+    client.save_cookies(COOKIES_FILE)
     return client
 
 PREDICTION_KEYWORDS = [
