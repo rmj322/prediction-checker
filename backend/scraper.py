@@ -4,8 +4,8 @@ import httpx
 
 APIFY_TOKEN = os.environ.get("APIFY_TOKEN")
 
-# Using apidojo/tweet-scraper - most reliable for user timeline scraping
-ACTOR_ID = "apidojo~tweet-scraper"
+# twitter-scraper-lite by apidojo - scrapes user timelines directly
+ACTOR_ID = "apidojo~twitter-scraper-lite"
 
 PREDICTION_KEYWORDS = [
     "will never", "will always", "i predict", "prediction:", "guaranteed",
@@ -23,16 +23,14 @@ def is_prediction(text: str) -> bool:
 async def get_prediction_tweets(username: str, max_tweets: int = 200) -> list[dict]:
     async with httpx.AsyncClient(timeout=180) as client:
 
-        # Start Apify actor run
+        # Start actor run - twitter-scraper-lite uses 'startUrls' with profile URLs
         run_response = await client.post(
             f"https://api.apify.com/v2/acts/{ACTOR_ID}/runs?token={APIFY_TOKEN}",
             json={
                 "startUrls": [
                     {"url": f"https://twitter.com/{username}"}
                 ],
-                "maxTweets": max_tweets,
-                "addUserInfo": True,
-                "scrapeTweetReplies": False,
+                "tweetsDesired": max_tweets,
             }
         )
 
@@ -70,20 +68,27 @@ async def get_prediction_tweets(username: str, max_tweets: int = 200) -> list[di
         if not isinstance(items, list):
             raise Exception(f"Unexpected Apify response: {items}")
 
-        # Filter for predictions only
+        # twitter-scraper-lite returns a single item with user + tweets array
         tweets = []
         for item in items:
-            # apidojo actor uses 'full_text' or 'text'
-            text = item.get("full_text") or item.get("text") or ""
-            if not text or text.startswith("RT "):
-                continue
-            if is_prediction(text):
-                tweet_id = str(item.get("id_str") or item.get("id") or "")
-                tweets.append({
-                    "id": tweet_id,
-                    "text": text,
-                    "created_at": item.get("created_at", ""),
-                    "url": f"https://x.com/{username}/status/{tweet_id}"
-                })
+            # Handle nested tweets array format
+            tweet_list = item.get("tweets", [])
+            if not tweet_list:
+                # Or flat format where each item is a tweet
+                tweet_list = [item] if item.get("full_text") or item.get("text") else []
+
+            for tweet in tweet_list:
+                text = tweet.get("full_text") or tweet.get("text") or tweet.get("contentText") or ""
+                if not text or text.startswith("RT "):
+                    continue
+                if is_prediction(text):
+                    tweet_id = str(tweet.get("id_str") or tweet.get("tweetId") or tweet.get("id") or "")
+                    created = tweet.get("created_at") or tweet.get("dateTime") or ""
+                    tweets.append({
+                        "id": tweet_id,
+                        "text": text,
+                        "created_at": created,
+                        "url": f"https://x.com/{username}/status/{tweet_id}"
+                    })
 
         return tweets
